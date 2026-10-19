@@ -185,7 +185,7 @@ useEffect(() => {
       if (playersError) throw playersError;
 
       // 3. Success State
-      const shareUrl = `${window.location.origin}/s/${accessCode}`;
+      const shareUrl = `${window.location.origin}/s?code=${accessCode}`;
       setGeneratedSession({ accessCode, url: shareUrl });
     } catch (err: any) {
       console.error('Failed to generate session:', err);
@@ -456,7 +456,7 @@ useEffect(() => {
 
                 <button
                   type="button"
-                  onClick={() => router.push(`/s/${generatedSession.accessCode}`)}
+                  onClick={() => router.push(`/s?code=${generatedSession.accessCode}`)}
                   className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold py-3.5 px-6 rounded-xl shadow-lg shadow-emerald-500/20 flex items-center justify-center space-x-2 transition-all transform active:scale-[0.99]"
                 >
                   <Play className="w-5 h-5 fill-slate-950" />
