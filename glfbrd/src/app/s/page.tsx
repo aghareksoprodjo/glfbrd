@@ -114,12 +114,14 @@ function SessionContent() {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'scores' },
         (payload) => {
-          if (payload.eventType === 'INSERT') {
+          if (payload.eventType === 'INSERT' || payload.eventType === 'UPDATE') {
             const newScore = payload.new as Score;
-            setScores((prev) => [...prev.filter((s) => s.id !== newScore.id), newScore]);
-          } else if (payload.eventType === 'UPDATE') {
-            const updatedScore = payload.new as Score;
-            setScores((prev) => prev.map((s) => (s.id === updatedScore.id ? updatedScore : s)));
+            setScores((prev) => {
+              const filtered = prev.filter(
+                (s) => !(s.player_id === newScore.player_id && s.hole_id === newScore.hole_id)
+              );
+              return [...filtered, newScore];
+            });
           } else if (payload.eventType === 'DELETE') {
             const deletedScore = payload.old as Score;
             setScores((prev) => prev.filter((s) => s.id !== deletedScore.id));
@@ -157,7 +159,7 @@ function SessionContent() {
     setScoreInput(existing ? String(existing.strokes) : '');
   };
 
-// Submit Score to Supabase
+  // Submit Score to Supabase (Idempotent Upsert)
   const handleSaveScore = async () => {
     if (!activeHole || !selectedPlayerId || !session) return;
 
@@ -170,44 +172,29 @@ function SessionContent() {
     setIsSavingScore(true);
 
     try {
-      const existing = scores.find(
-        (s) => s.player_id === selectedPlayerId && s.hole_id === activeHole.id
-      );
-
-      if (existing) {
-        // Update
-        const { data, error } = await supabase
-          .from('scores')
-          .update({ strokes: numScore })
-          .eq('id', existing.id)
-          .select();
-
-        if (error) {
-          console.error('Update Score Error details:', error.message, error.details, error.hint);
-          throw error;
-        }
-        if (data && data.length > 0) {
-          setScores((prev) => prev.map((s) => (s.id === data[0].id ? data[0] : s)));
-        }
-      } else {
-        // Insert
-        const { data, error } = await supabase
-          .from('scores')
-          .insert({
+      const { data, error } = await supabase
+        .from('scores')
+        .upsert(
+          {
             session_id: session.id,
             player_id: selectedPlayerId,
             hole_id: activeHole.id,
             strokes: numScore,
-          })
-          .select();
+          },
+          { onConflict: 'session_id,player_id,hole_id' }
+        )
+        .select();
 
-        if (error) {
-          console.error('Insert Score Error details:', error.message, error.details, error.hint);
-          throw error;
-        }
-        if (data && data.length > 0) {
-          setScores((prev) => [...prev, data[0]]);
-        }
+      if (error) throw error;
+
+      if (data && data.length > 0) {
+        const savedScore = data[0];
+        setScores((prev) => {
+          const filtered = prev.filter(
+            (s) => !(s.player_id === savedScore.player_id && s.hole_id === savedScore.hole_id)
+          );
+          return [...filtered, savedScore];
+        });
       }
 
       setActiveHole(null);
@@ -226,12 +213,48 @@ function SessionContent() {
     const dist = distances.find(
       (d) => d.hole_id === holeId && d.tee_id === playerTeeId
     );
-    return dist ? `${dist.distance_meters}m` : '-';
+    return dist ? `${dist.distance_meters}` : '-';
   };
 
   // Active Identified Player Object
   const activePlayer = players.find((p) => p.id === selectedPlayerId);
   const activePlayerTee = tees.find((t) => t.id === activePlayer?.tee_id);
+
+  // Scorecard Nine-Split Logic & Totals
+  const frontHoles = holes.filter((h) => h.hole_number <= 9);
+  const backHoles = holes.filter((h) => h.hole_number >= 10);
+
+  const frontParTotal = frontHoles.reduce((sum, h) => sum + h.par, 0);
+  const backParTotal = backHoles.reduce((sum, h) => sum + h.par, 0);
+  const grandParTotal = frontParTotal + backParTotal;
+
+  const frontDistTotal = activePlayer?.tee_id
+    ? frontHoles.reduce((sum, h) => {
+        const d = distances.find((dist) => dist.hole_id === h.id && dist.tee_id === activePlayer.tee_id);
+        return sum + (d?.distance_meters || 0);
+      }, 0)
+    : 0;
+
+  const backDistTotal = activePlayer?.tee_id
+    ? backHoles.reduce((sum, h) => {
+        const d = distances.find((dist) => dist.hole_id === h.id && dist.tee_id === activePlayer.tee_id);
+        return sum + (d?.distance_meters || 0);
+      }, 0)
+    : 0;
+
+  const grandDistTotal = frontDistTotal + backDistTotal;
+
+  // Active Player Stroke Calculations
+  const playerScores = activePlayer ? scores.filter((s) => s.player_id === activePlayer.id) : [];
+
+  const frontPlayerScores = frontHoles.map((h) => playerScores.find((s) => s.hole_id === h.id)).filter(Boolean) as Score[];
+  const frontStrokesTotal = frontPlayerScores.reduce((sum, s) => sum + s.strokes, 0);
+
+  const backPlayerScores = backHoles.map((h) => playerScores.find((s) => s.hole_id === h.id)).filter(Boolean) as Score[];
+  const backStrokesTotal = backPlayerScores.reduce((sum, s) => sum + s.strokes, 0);
+
+  const grandStrokesTotal = frontStrokesTotal + backStrokesTotal;
+  const grandHolesPlayedTotal = frontPlayerScores.length + backPlayerScores.length;
 
   // Render Hole Score Badge with Golf Formatting Shapes
   const renderScoreShape = (strokes: number | undefined, par: number) => {
@@ -242,7 +265,7 @@ function SessionContent() {
     // Eagle or better (-2 or less): Double Circle
     if (diff <= -2) {
       return (
-        <div className="relative flex items-center justify-center w-8 h-8 rounded-full border-2 border-amber-400 bg-amber-500/20 text-amber-300 font-black text-sm shadow-md">
+        <div className="relative flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 rounded-full border-2 border-amber-400 bg-amber-500/20 text-amber-300 font-black text-xs sm:text-sm shadow-md">
           <div className="absolute inset-0.5 rounded-full border border-amber-400" />
           {strokes}
         </div>
@@ -251,7 +274,7 @@ function SessionContent() {
     // Birdie (-1): Single Circle
     if (diff === -1) {
       return (
-        <div className="flex items-center justify-center w-8 h-8 rounded-full border-2 border-amber-400 text-amber-400 font-bold text-sm bg-amber-400/10">
+        <div className="flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 rounded-full border-2 border-amber-400 text-amber-400 font-bold text-xs sm:text-sm bg-amber-400/10">
           {strokes}
         </div>
       );
@@ -259,7 +282,7 @@ function SessionContent() {
     // Par (0): Standard clean text
     if (diff === 0) {
       return (
-        <div className="flex items-center justify-center w-8 h-8 text-white font-bold text-sm">
+        <div className="flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 text-white font-bold text-xs sm:text-sm">
           {strokes}
         </div>
       );
@@ -267,29 +290,35 @@ function SessionContent() {
     // Bogey (+1): Single Square
     if (diff === 1) {
       return (
-        <div className="flex items-center justify-center w-7 h-7 border-2 border-slate-400 text-slate-300 font-bold text-sm">
+        <div className="flex items-center justify-center w-6 h-6 sm:w-7 sm:h-7 border-2 border-slate-400 text-slate-300 font-bold text-xs sm:text-sm">
           {strokes}
         </div>
       );
     }
     // Double Bogey or worse (+2 or higher): Double Square
     return (
-      <div className="relative flex items-center justify-center w-8 h-8 border-2 border-slate-500 bg-slate-900 text-slate-300 font-bold text-sm">
+      <div className="relative flex items-center justify-center w-7 h-7 sm:w-8 sm:h-8 border-2 border-slate-500 bg-slate-900 text-slate-300 font-bold text-xs sm:text-sm">
         <div className="absolute inset-0.5 border border-slate-500" />
         {strokes}
       </div>
     );
   };
 
-  // Compute Live Leaderboard
+  // Compute Live Leaderboard (Deduplicated by Hole ID)
   const leaderboard = players.map((player) => {
-    const playerScores = scores.filter((s) => s.player_id === player.id);
-    const holesPlayed = playerScores.length;
+    // Map hole_id -> latest score for this player to prevent duplicates
+    const uniqueScoresMap = new Map<string, Score>();
+    scores
+      .filter((s) => s.player_id === player.id)
+      .forEach((s) => uniqueScoresMap.set(s.hole_id, s));
+
+    const uniquePlayerScores = Array.from(uniqueScoresMap.values());
+    const holesPlayed = uniquePlayerScores.length;
 
     let totalStrokes = 0;
     let totalParPlayed = 0;
 
-    playerScores.forEach((s) => {
+    uniquePlayerScores.forEach((s) => {
       const h = holes.find((hole) => hole.id === s.hole_id);
       if (h) {
         totalStrokes += s.strokes;
@@ -529,9 +558,9 @@ function SessionContent() {
           </div>
         )}
 
-        {/* 18-HOLE SCORECARD SECTION */}
+        {/* 18-HOLE SPLIT SCORECARD SECTION */}
         {isIdentified && activePlayer && (
-          <section className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-4 shadow-xl">
+          <section className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 space-y-6 shadow-xl">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div>
                 <h2 className="text-sm font-black uppercase tracking-wider text-amber-400">
@@ -544,75 +573,185 @@ function SessionContent() {
               <span className="text-xs text-slate-500 font-mono">18 Holes</span>
             </div>
 
-            {/* Scorecard Table View */}
-            <div className="overflow-x-auto -mx-4 sm:mx-0 px-4 sm:px-0">
-              <div className="min-w-[640px]">
-                {/* Hole Numbers Header */}
-                <div className="grid grid-cols-[100px_repeat(18,minmax(32px,1fr))] bg-slate-950 text-[11px] font-bold text-slate-400 border border-slate-800 rounded-t-xl text-center divide-x divide-slate-800">
-                  <div className="py-2 px-2 text-left text-slate-300">Hole</div>
-                  {holes.map((h) => (
-                    <div key={h.id} className="py-2">
-                      {h.hole_number}
-                    </div>
-                  ))}
-                </div>
-
-                {/* Par Row */}
-                <div className="grid grid-cols-[100px_repeat(18,minmax(32px,1fr))] bg-slate-900/90 text-[11px] font-semibold text-slate-400 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
-                  <div className="py-1.5 px-2 text-left uppercase text-[10px]">Par</div>
-                  {holes.map((h) => (
-                    <div key={h.id} className="py-1.5 text-slate-300 font-mono">
-                      {h.par}
-                    </div>
-                  ))}
-                </div>
-
-                {/* Distance Row */}
-                <div className="grid grid-cols-[100px_repeat(18,minmax(32px,1fr))] bg-slate-900/60 text-[10px] text-slate-500 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
-                  <div className="py-1 px-2 text-left uppercase text-[9px]">Dist (m)</div>
-                  {holes.map((h) => (
-                    <div key={h.id} className="py-1 font-mono text-[9px]">
-                      {getDistanceForHole(h.id, activePlayer.tee_id)}
-                    </div>
-                  ))}
-                </div>
-
-                {/* Handicap Index Row */}
-                <div className="grid grid-cols-[100px_repeat(18,minmax(32px,1fr))] bg-slate-900/40 text-[10px] text-slate-500 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
-                  <div className="py-1 px-2 text-left uppercase text-[9px]">HCP</div>
-                  {holes.map((h) => (
-                    <div key={h.id} className="py-1 font-mono text-[9px]">
-                      {h.handicap_index}
-                    </div>
-                  ))}
-                </div>
-
-                {/* Score Input Interactive Row */}
-                <div className="grid grid-cols-[100px_repeat(18,minmax(32px,1fr))] bg-slate-950/80 border-x border-b border-slate-800 rounded-b-xl text-center divide-x divide-slate-800 items-center">
-                  <div className="py-3 px-2 text-left font-bold text-xs text-amber-400 truncate">
-                    {activePlayer.name}
+            {/* FRONT NINE (HOLES 1 - 9) */}
+            <div className="space-y-2">
+              <div className="text-xs font-extrabold uppercase tracking-widest text-slate-400 flex items-center justify-between px-1">
+                <span>Front Nine (Out)</span>
+                <span className="text-amber-400 font-mono">
+                  {frontPlayerScores.length > 0 ? `${frontStrokesTotal} Strokes` : `Par ${frontParTotal}`}
+                </span>
+              </div>
+              <div className="overflow-x-auto -mx-4 sm:mx-0 px-4 sm:px-0">
+                <div className="min-w-[340px]">
+                  {/* Front Hole Numbers Header */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_48px] bg-slate-950 text-[11px] font-bold text-slate-400 border border-slate-800 rounded-t-xl text-center divide-x divide-slate-800">
+                    <div className="py-2 px-1 text-left text-slate-300 pl-2">Hole</div>
+                    {frontHoles.map((h) => (
+                      <div key={h.id} className="py-2">
+                        {h.hole_number}
+                      </div>
+                    ))}
+                    <div className="py-2 bg-amber-500/10 text-amber-400 font-black">OUT</div>
                   </div>
-                  {holes.map((h) => {
-                    const existingScore = scores.find(
-                      (s) => s.player_id === activePlayer.id && s.hole_id === h.id
-                    );
 
-                    return (
-                      <button
-                        key={h.id}
-                        onClick={() => handleOpenScoreModal(h)}
-                        className="py-2.5 flex items-center justify-center hover:bg-amber-500/10 transition-colors focus:outline-none"
-                      >
-                        {existingScore ? (
-                          renderScoreShape(existingScore.strokes, h.par)
-                        ) : (
-                          <span className="w-7 h-7 rounded border border-dashed border-slate-700 hover:border-amber-400 flex items-center justify-center text-slate-600 text-xs font-mono">
-                            -
-                          </span>
-                        )}
-                      </button>
-                    );
-                  })}
+                  {/* Front Par Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_48px] bg-slate-900/90 text-[11px] font-semibold text-slate-400 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
+                    <div className="py-1.5 px-1 text-left uppercase text-[10px] pl-2">Par</div>
+                    {frontHoles.map((h) => (
+                      <div key={h.id} className="py-1.5 text-slate-300 font-mono">
+                        {h.par}
+                      </div>
+                    ))}
+                    <div className="py-1.5 font-bold font-mono text-slate-200 bg-amber-500/10">{frontParTotal}</div>
+                  </div>
+
+                  {/* Front Distance Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_48px] bg-slate-900/60 text-[10px] text-slate-500 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
+                    <div className="py-1 px-1 text-left uppercase text-[9px] pl-2">Dist</div>
+                    {frontHoles.map((h) => (
+                      <div key={h.id} className="py-1 font-mono text-[9px]">
+                        {getDistanceForHole(h.id, activePlayer.tee_id)}
+                      </div>
+                    ))}
+                    <div className="py-1 font-mono text-[9px] text-slate-400 bg-amber-500/5">{frontDistTotal ? `${frontDistTotal}m` : '-'}</div>
+                  </div>
+
+                  {/* Front Handicap Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_48px] bg-slate-900/40 text-[10px] text-slate-500 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
+                    <div className="py-1 px-1 text-left uppercase text-[9px] pl-2">HCP</div>
+                    {frontHoles.map((h) => (
+                      <div key={h.id} className="py-1 font-mono text-[9px]">
+                        {h.handicap_index}
+                      </div>
+                    ))}
+                    <div className="py-1 font-mono text-[9px] text-slate-600 bg-amber-500/5">-</div>
+                  </div>
+
+                  {/* Front Score Interactive Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_48px] bg-slate-950/80 border-x border-b border-slate-800 rounded-b-xl text-center divide-x divide-slate-800 items-center">
+                    <div className="py-3 px-1 text-left font-bold text-xs text-amber-400 truncate pl-2">
+                      Score
+                    </div>
+                    {frontHoles.map((h) => {
+                      const existingScore = scores.find(
+                        (s) => s.player_id === activePlayer.id && s.hole_id === h.id
+                      );
+
+                      return (
+                        <button
+                          key={h.id}
+                          onClick={() => handleOpenScoreModal(h)}
+                          className="py-2 flex items-center justify-center hover:bg-amber-500/10 transition-colors focus:outline-none"
+                        >
+                          {existingScore ? (
+                            renderScoreShape(existingScore.strokes, h.par)
+                          ) : (
+                            <span className="w-6 h-6 rounded border border-dashed border-slate-700 hover:border-amber-400 flex items-center justify-center text-slate-600 text-xs font-mono">
+                              -
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                    <div className="py-2.5 font-black text-sm font-mono text-amber-300 bg-amber-500/10">
+                      {frontPlayerScores.length > 0 ? frontStrokesTotal : '-'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* BACK NINE (HOLES 10 - 18) & TOTALS */}
+            <div className="space-y-2 pt-2">
+              <div className="text-xs font-extrabold uppercase tracking-widest text-slate-400 flex items-center justify-between px-1">
+                <span>Back Nine (In) & Total</span>
+                <span className="text-amber-400 font-mono">
+                  {backPlayerScores.length > 0 ? `${backStrokesTotal} Strokes` : `Par ${backParTotal}`}
+                </span>
+              </div>
+              <div className="overflow-x-auto -mx-4 sm:mx-0 px-4 sm:px-0">
+                <div className="min-w-[360px]">
+                  {/* Back Hole Numbers Header */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_44px_48px] bg-slate-950 text-[11px] font-bold text-slate-400 border border-slate-800 rounded-t-xl text-center divide-x divide-slate-800">
+                    <div className="py-2 px-1 text-left text-slate-300 pl-2">Hole</div>
+                    {backHoles.map((h) => (
+                      <div key={h.id} className="py-2">
+                        {h.hole_number}
+                      </div>
+                    ))}
+                    <div className="py-2 bg-amber-500/10 text-amber-400 font-black">IN</div>
+                    <div className="py-2 bg-amber-500 text-slate-950 font-black">TOT</div>
+                  </div>
+
+                  {/* Back Par Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_44px_48px] bg-slate-900/90 text-[11px] font-semibold text-slate-400 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
+                    <div className="py-1.5 px-1 text-left uppercase text-[10px] pl-2">Par</div>
+                    {backHoles.map((h) => (
+                      <div key={h.id} className="py-1.5 text-slate-300 font-mono">
+                        {h.par}
+                      </div>
+                    ))}
+                    <div className="py-1.5 font-bold font-mono text-slate-200 bg-amber-500/10">{backParTotal}</div>
+                    <div className="py-1.5 font-black font-mono text-slate-100 bg-amber-500/20">{grandParTotal}</div>
+                  </div>
+
+                  {/* Back Distance Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_44px_48px] bg-slate-900/60 text-[10px] text-slate-500 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
+                    <div className="py-1 px-1 text-left uppercase text-[9px] pl-2">Dist</div>
+                    {backHoles.map((h) => (
+                      <div key={h.id} className="py-1 font-mono text-[9px]">
+                        {getDistanceForHole(h.id, activePlayer.tee_id)}
+                      </div>
+                    ))}
+                    <div className="py-1 font-mono text-[9px] text-slate-400 bg-amber-500/5">{backDistTotal ? `${backDistTotal}m` : '-'}</div>
+                    <div className="py-1 font-mono text-[9px] text-slate-300 bg-amber-500/10">{grandDistTotal ? `${grandDistTotal}m` : '-'}</div>
+                  </div>
+
+                  {/* Back Handicap Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_44px_48px] bg-slate-900/40 text-[10px] text-slate-500 border-x border-b border-slate-800 text-center divide-x divide-slate-800">
+                    <div className="py-1 px-1 text-left uppercase text-[9px] pl-2">HCP</div>
+                    {backHoles.map((h) => (
+                      <div key={h.id} className="py-1 font-mono text-[9px]">
+                        {h.handicap_index}
+                      </div>
+                    ))}
+                    <div className="py-1 font-mono text-[9px] text-slate-600 bg-amber-500/5">-</div>
+                    <div className="py-1 font-mono text-[9px] text-slate-600 bg-amber-500/10">-</div>
+                  </div>
+
+                  {/* Back Score Interactive Row */}
+                  <div className="grid grid-cols-[60px_repeat(9,minmax(26px,1fr))_44px_48px] bg-slate-950/80 border-x border-b border-slate-800 rounded-b-xl text-center divide-x divide-slate-800 items-center">
+                    <div className="py-3 px-1 text-left font-bold text-xs text-amber-400 truncate pl-2">
+                      Score
+                    </div>
+                    {backHoles.map((h) => {
+                      const existingScore = scores.find(
+                        (s) => s.player_id === activePlayer.id && s.hole_id === h.id
+                      );
+
+                      return (
+                        <button
+                          key={h.id}
+                          onClick={() => handleOpenScoreModal(h)}
+                          className="py-2 flex items-center justify-center hover:bg-amber-500/10 transition-colors focus:outline-none"
+                        >
+                          {existingScore ? (
+                            renderScoreShape(existingScore.strokes, h.par)
+                          ) : (
+                            <span className="w-6 h-6 rounded border border-dashed border-slate-700 hover:border-amber-400 flex items-center justify-center text-slate-600 text-xs font-mono">
+                              -
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                    <div className="py-2.5 font-black text-sm font-mono text-amber-300 bg-amber-500/10">
+                      {backPlayerScores.length > 0 ? backStrokesTotal : '-'}
+                    </div>
+                    <div className="py-2.5 font-black text-sm font-mono text-amber-400 bg-amber-500/20">
+                      {grandHolesPlayedTotal > 0 ? grandStrokesTotal : '-'}
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -642,7 +781,7 @@ function SessionContent() {
                   <th className="py-3 px-3 text-center w-12">Pos</th>
                   <th className="py-3 px-4">Player</th>
                   <th className="py-3 px-3 text-center">Score</th>
-                  <th className="py-3 px-3 text-center">Holes Played</th>
+                  <th className="py-3 px-3 text-center">Thru</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800/80 font-medium">
@@ -705,7 +844,7 @@ function SessionContent() {
                             {item.totalStrokes} (F)
                           </span>
                         ) : (
-                          <span>{item.holesPlayed} / 18</span>
+                          <span>{item.holesPlayed > 0 ? item.holesPlayed : '-'}</span>
                         )}
                       </td>
                     </tr>
@@ -727,7 +866,7 @@ function SessionContent() {
                   Hole {activeHole.hole_number} Score
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Par {activeHole.par} • HCP {activeHole.handicap_index} • {getDistanceForHole(activeHole.id, activePlayer.tee_id)}
+                  Par {activeHole.par} • HCP {activeHole.handicap_index} • {getDistanceForHole(activeHole.id, activePlayer.tee_id)}m
                 </p>
               </div>
               <button
