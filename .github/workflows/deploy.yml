@@ -23,6 +23,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: List root files for debugging
+        run: |
+          pwd
+          ls -la
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
