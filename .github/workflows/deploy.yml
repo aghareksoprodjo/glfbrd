@@ -20,13 +20,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: List root files for debugging
-        run: |
-          pwd
-          ls -la
 
       - name: Setup Node
         uses: actions/setup-node@v4
