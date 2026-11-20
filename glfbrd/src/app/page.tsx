@@ -12,12 +12,20 @@ interface PlayerInput {
   teeId: string;
 }
 
+interface CourseCombination {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
+
 export default function LandingPage() {
   const router = useRouter();
 
   // Form State
   const [courses, setCourses] = useState<Course[]>([]);
   const [selectedCourseId, setSelectedCourseId] = useState<string>('');
+  const [combinations, setCombinations] = useState<CourseCombination[]>([]);
+  const [selectedCombinationId, setSelectedCombinationId] = useState<string>('');
   const [availableTees, setAvailableTees] = useState<Tee[]>([]);
   const [playDate, setPlayDate] = useState<string>('');
   const [players, setPlayers] = useState<PlayerInput[]>([
@@ -42,39 +50,53 @@ export default function LandingPage() {
   }, []);
 
   // Fetch Courses on Mount
-useEffect(() => {
-  async function fetchCourses() {
-    setLoadingCourses(true);
-    
-    // Debug: Log environment check
-    console.log("Supabase URL Configured:", process.env.NEXT_PUBLIC_SUPABASE_URL ? "YES" : "NO");
+  useEffect(() => {
+    async function fetchCourses() {
+      setLoadingCourses(true);
 
-    const { data, error } = await supabase
-      .from('courses')
-      .select('*')
-      .order('name', { ascending: true });
+      const { data, error } = await supabase
+        .from('courses')
+        .select('*')
+        .order('name', { ascending: true });
 
-    if (error) {
-      // Print detailed properties of the error
-      console.error('Full Supabase Error Object:', error);
-      console.error('Message:', error.message);
-      console.error('Details:', error.details);
-      console.error('Hint:', error.hint);
-      console.error('Code:', error.code);
+      if (error) {
+        console.error('Full Supabase Error Object:', error);
+        setErrorMessage(`Failed to load courses: ${error.message || 'Check browser console'}`);
+      } else if (data) {
+        setCourses(data);
+        if (data.length > 0) {
+          setSelectedCourseId(data[0].id);
+        }
+      }
+      setLoadingCourses(false);
+    }
 
-      setErrorMessage(`Failed to load courses: ${error.message || 'Check browser console'}`);
-    } else if (data) {
-      console.log('Courses fetched successfully:', data);
-      setCourses(data);
-      if (data.length > 0) {
-        setSelectedCourseId(data[0].id);
+    fetchCourses();
+  }, []);
+
+  // Fetch Combinations whenever Selected Course Changes
+  useEffect(() => {
+    if (!selectedCourseId) return;
+
+    async function fetchCombinations() {
+      setCombinations([]);
+      setSelectedCombinationId('');
+
+      const { data, error } = await supabase
+        .from('course_combinations')
+        .select('id, name, is_default')
+        .eq('course_id', selectedCourseId)
+        .order('is_default', { ascending: false });
+
+      if (!error && data && data.length > 0) {
+        setCombinations(data);
+        const defaultCombo = data.find((c) => c.is_default) || data[0];
+        setSelectedCombinationId(defaultCombo.id);
       }
     }
-    setLoadingCourses(false);
-  }
 
-  fetchCourses();
-}, []);
+    fetchCombinations();
+  }, [selectedCourseId]);
 
   // Fetch Tees whenever Selected Course Changes
   useEffect(() => {
@@ -148,6 +170,11 @@ useEffect(() => {
       return;
     }
 
+    if (combinations.length > 1 && !selectedCombinationId) {
+      setErrorMessage('Please select an 18-hole configuration.');
+      return;
+    }
+
     const validPlayers = players.filter((p) => p.name.trim() !== '');
     if (validPlayers.length === 0) {
       setErrorMessage('Please enter at least one player name.');
@@ -159,12 +186,13 @@ useEffect(() => {
     try {
       const accessCode = generateAccessCode();
 
-      // 1. Insert Session
+      // 1. Insert Session (with combination_id)
       const { data: sessionData, error: sessionError } = await supabase
         .from('sessions')
         .insert({
           access_code: accessCode,
           course_id: selectedCourseId,
+          combination_id: selectedCombinationId || null,
           play_date: playDate || new Date().toISOString().split('T')[0],
         })
         .select()
@@ -306,6 +334,31 @@ useEffect(() => {
                   </select>
                 )}
               </div>
+
+              {/* Course Configuration Selector — Rendered ONLY if the course has 2+ configurations */}
+              {combinations.length > 1 && (
+                <div className="sm:col-span-2">
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="block text-xs font-medium text-slate-300">
+                      18-Hole Configuration
+                    </label>
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-amber-400/90">
+                      Multi-Loop Course
+                    </span>
+                  </div>
+                  <select
+                    value={selectedCombinationId}
+                    onChange={(e) => setSelectedCombinationId(e.target.value)}
+                    className="w-full bg-slate-950 border border-amber-500/40 rounded-xl px-3.5 py-2.5 text-sm text-white focus:outline-none focus:border-amber-500 focus:ring-1 focus:ring-amber-500 transition-colors"
+                  >
+                    {combinations.map((combo) => (
+                      <option key={combo.id} value={combo.id}>
+                        {combo.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
             </div>
           </div>
 
