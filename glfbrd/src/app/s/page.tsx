@@ -1,10 +1,21 @@
 'use client';
 
-import { useState, useEffect, Suspense } from 'react';
+import { useState, useEffect, Suspense, useCallback } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { Session, Course, Tee, Hole, HoleDistance, Player, Score } from '@/types/database';
 import { Flag, Trophy, UserCheck, RefreshCw, CheckCircle2, Share2, ArrowLeft } from 'lucide-react';
+
+interface SessionHole extends Hole {
+  physical_hole_number?: number;
+  loop_name?: string | null;
+}
+
+interface CourseCombination {
+  id: string;
+  name: string;
+  is_default: boolean;
+}
 
 function SessionContent() {
   const searchParams = useSearchParams();
@@ -15,8 +26,11 @@ function SessionContent() {
   // Data State
   const [session, setSession] = useState<Session | null>(null);
   const [course, setCourse] = useState<Course | null>(null);
+  const [combinations, setCombinations] = useState<CourseCombination[]>([]);
+  const [activeCombinationId, setActiveCombinationId] = useState<string>('');
+  const [isUpdatingCombination, setIsUpdatingCombination] = useState<boolean>(false);
   const [tees, setTees] = useState<Tee[]>([]);
-  const [holes, setHoles] = useState<Hole[]>([]);
+  const [holes, setHoles] = useState<SessionHole[]>([]);
   const [distances, setDistances] = useState<HoleDistance[]>([]);
   const [players, setPlayers] = useState<Player[]>([]);
   const [scores, setScores] = useState<Score[]>([]);
@@ -31,10 +45,79 @@ function SessionContent() {
   const [isIdentified, setIsIdentified] = useState<boolean>(false);
 
   // Score Input Modal State
-  const [activeHole, setActiveHole] = useState<Hole | null>(null);
+  const [activeHole, setActiveHole] = useState<SessionHole | null>(null);
   const [scoreInput, setScoreInput] = useState<string>('');
   const [isSavingScore, setIsSavingScore] = useState<boolean>(false);
   const [copiedShare, setCopiedShare] = useState<boolean>(false);
+
+  // Helper to fetch 18 holes for a given combination (or legacy fallback)
+  const fetchHolesForSession = useCallback(
+    async (courseId: string, combinationId: string | null) => {
+      let resolvedHoles: SessionHole[] = [];
+
+      if (combinationId) {
+        const { data: comboHolesData, error: comboErr } = await supabase
+          .from('combination_holes')
+          .select(`
+            round_hole_number,
+            handicap_index,
+            holes (
+              id,
+              course_id,
+              loop_id,
+              hole_number,
+              par,
+              course_loops (
+                name
+              )
+            )
+          `)
+          .eq('combination_id', combinationId)
+          .order('round_hole_number', { ascending: true });
+
+        if (!comboErr && comboHolesData && comboHolesData.length > 0) {
+          resolvedHoles = comboHolesData.map((row: any) => ({
+            id: row.holes.id,
+            course_id: row.holes.course_id,
+            hole_number: row.round_hole_number,
+            physical_hole_number: row.holes.hole_number,
+            loop_name: row.holes.course_loops?.name || null,
+            par: row.holes.par,
+            handicap_index: row.handicap_index,
+          }));
+        }
+      }
+
+      // Legacy fallback for pre-migration sessions without combination_id
+      if (resolvedHoles.length === 0) {
+        const { data: legacyHoles } = await supabase
+          .from('holes')
+          .select('*')
+          .eq('course_id', courseId)
+          .order('hole_number', { ascending: true });
+
+        if (legacyHoles) {
+          resolvedHoles = legacyHoles;
+        }
+      }
+
+      setHoles(resolvedHoles);
+
+      // Fetch Hole Distances mapped to physical hole IDs
+      if (resolvedHoles.length > 0) {
+        const holeIds = resolvedHoles.map((h) => h.id);
+        const { data: distData } = await supabase
+          .from('hole_distances')
+          .select('*')
+          .in('hole_id', holeIds);
+
+        if (distData) setDistances(distData);
+      } else {
+        setDistances([]);
+      }
+    },
+    []
+  );
 
   // 1. Fetch Session Data & Setup Realtime Listener
   useEffect(() => {
@@ -64,31 +147,38 @@ function SessionContent() {
 
         setSession(sessionData);
 
-        // Fetch Course, Tees, Holes, Players, Scores
-        const [courseRes, teesRes, holesRes, playersRes, scoresRes] = await Promise.all([
+        // Fetch Course, Combinations, Tees, Players, Scores
+        const [courseRes, combosRes, teesRes, playersRes, scoresRes] = await Promise.all([
           supabase.from('courses').select('*').eq('id', sessionData.course_id).single(),
+          supabase
+            .from('course_combinations')
+            .select('id, name, is_default')
+            .eq('course_id', sessionData.course_id)
+            .order('is_default', { ascending: false }),
           supabase.from('tees').select('*').eq('course_id', sessionData.course_id),
-          supabase.from('holes').select('*').eq('course_id', sessionData.course_id).order('hole_number', { ascending: true }),
           supabase.from('players').select('*').eq('session_id', sessionData.id),
           supabase.from('scores').select('*').eq('session_id', sessionData.id),
         ]);
 
         if (courseRes.data) setCourse(courseRes.data);
         if (teesRes.data) setTees(teesRes.data);
-        if (holesRes.data) setHoles(holesRes.data);
         if (playersRes.data) setPlayers(playersRes.data);
         if (scoresRes.data) setScores(scoresRes.data);
 
-        // Fetch Hole Distances
-        if (holesRes.data && holesRes.data.length > 0) {
-          const holeIds = holesRes.data.map((h) => h.id);
-          const { data: distData } = await supabase
-            .from('hole_distances')
-            .select('*')
-            .in('hole_id', holeIds);
+        const availableCombos = combosRes.data || [];
+        setCombinations(availableCombos);
 
-          if (distData) setDistances(distData);
-        }
+        // Determine active combination_id (use session's combination_id or course default)
+        const resolvedComboId =
+          (sessionData as any).combination_id ||
+          availableCombos.find((c) => c.is_default)?.id ||
+          availableCombos[0]?.id ||
+          '';
+
+        setActiveCombinationId(resolvedComboId);
+
+        // Fetch 18 holes for this combination
+        await fetchHolesForSession(sessionData.course_id, resolvedComboId || null);
 
         // Check LocalStorage for previously identified player in this session
         const storedPlayerId = localStorage.getItem(`glfbrd_identified_${sessionData.id}`);
@@ -96,7 +186,6 @@ function SessionContent() {
           setSelectedPlayerId(storedPlayerId);
           setIsIdentified(true);
         }
-
       } catch (err: any) {
         console.error('Error loading session:', err);
         setError('Failed to load session details.');
@@ -107,7 +196,7 @@ function SessionContent() {
 
     loadSessionData();
 
-    // Realtime Subscriptions for Scores
+    // Realtime Subscriptions for Scores & Session Routing Updates
     const channel = supabase
       .channel(`session_scores_${accessCode}`)
       .on(
@@ -128,12 +217,46 @@ function SessionContent() {
           }
         }
       )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'sessions', filter: `access_code=eq.${accessCode}` },
+        async (payload) => {
+          const updatedSession = payload.new as any;
+          if (updatedSession?.combination_id) {
+            setActiveCombinationId(updatedSession.combination_id);
+            await fetchHolesForSession(updatedSession.course_id, updatedSession.combination_id);
+          }
+        }
+      )
       .subscribe();
 
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [accessCode]);
+  }, [accessCode, fetchHolesForSession]);
+
+  // Handle changing the 18-hole combination directly on the scorecard (e.g. Starter reassignment)
+  const handleCombinationChange = async (newCombinationId: string) => {
+    if (!session || !newCombinationId || newCombinationId === activeCombinationId) return;
+
+    setIsUpdatingCombination(true);
+    try {
+      const { error: updateErr } = await supabase
+        .from('sessions')
+        .update({ combination_id: newCombinationId })
+        .eq('id', session.id);
+
+      if (updateErr) throw updateErr;
+
+      setActiveCombinationId(newCombinationId);
+      await fetchHolesForSession(session.course_id, newCombinationId);
+    } catch (err: any) {
+      console.error('Error updating 18-hole configuration:', err);
+      alert('Failed to update 18-hole configuration.');
+    } finally {
+      setIsUpdatingCombination(false);
+    }
+  };
 
   // Player Identification Confirmation
   const handleConfirmPlayer = () => {
@@ -149,7 +272,7 @@ function SessionContent() {
   };
 
   // Score Box Click Handler
-  const handleOpenScoreModal = (hole: Hole) => {
+  const handleOpenScoreModal = (hole: SessionHole) => {
     if (!selectedPlayerId) return;
     setActiveHole(hole);
 
@@ -223,6 +346,9 @@ function SessionContent() {
   // Scorecard Nine-Split Logic & Totals
   const frontHoles = holes.filter((h) => h.hole_number <= 9);
   const backHoles = holes.filter((h) => h.hole_number >= 10);
+
+  const frontLoopName = frontHoles[0]?.loop_name;
+  const backLoopName = backHoles[0]?.loop_name;
 
   const frontParTotal = frontHoles.reduce((sum, h) => sum + h.par, 0);
   const backParTotal = backHoles.reduce((sum, h) => sum + h.par, 0);
@@ -306,7 +432,6 @@ function SessionContent() {
 
   // Compute Live Leaderboard (Deduplicated by Hole ID)
   const leaderboard = players.map((player) => {
-    // Map hole_id -> latest score for this player to prevent duplicates
     const uniqueScoresMap = new Map<string, Score>();
     scores
       .filter((s) => s.player_id === player.id)
@@ -470,16 +595,37 @@ function SessionContent() {
       <main className="max-w-4xl mx-auto px-4 pt-6 space-y-8">
         {/* Course Banner */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 sm:p-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-xl">
-          <div>
+          <div className="space-y-1.5">
             <span className="text-[10px] font-bold uppercase tracking-widest text-amber-400">
               Live Golf Session
             </span>
             <h1 className="text-xl sm:text-2xl font-black text-white tracking-tight">
               {course.name}
             </h1>
-            <p className="text-xs text-slate-400 mt-0.5">
+            <p className="text-xs text-slate-400">
               {course.region} • {session.play_date}
             </p>
+
+            {/* 18-Hole Routing Switcher — Shown ONLY for multi-loop courses */}
+            {combinations.length > 1 && (
+              <div className="pt-1.5 flex items-center gap-2">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                  Routing:
+                </span>
+                <select
+                  value={activeCombinationId}
+                  disabled={isUpdatingCombination}
+                  onChange={(e) => handleCombinationChange(e.target.value)}
+                  className="bg-slate-950 border border-amber-500/40 rounded-lg px-2.5 py-1 text-xs font-semibold text-amber-300 focus:outline-none focus:border-amber-500 transition-colors disabled:opacity-50"
+                >
+                  {combinations.map((combo) => (
+                    <option key={combo.id} value={combo.id}>
+                      {combo.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
 
           {/* Scoring As Badge */}
@@ -576,7 +722,9 @@ function SessionContent() {
             {/* FRONT NINE (HOLES 1 - 9) */}
             <div className="space-y-2">
               <div className="text-xs font-extrabold uppercase tracking-widest text-slate-400 flex items-center justify-between px-1">
-                <span>Front Nine (Out)</span>
+                <span>
+                  Front Nine {frontLoopName ? `• ${frontLoopName} ` : ''}(Out)
+                </span>
                 <span className="text-amber-400 font-mono">
                   {frontPlayerScores.length > 0 ? `${frontStrokesTotal} Strokes` : `Par ${frontParTotal}`}
                 </span>
@@ -621,7 +769,7 @@ function SessionContent() {
                     <div className="py-1 px-1 text-left uppercase text-[9px] pl-2">HCP</div>
                     {frontHoles.map((h) => (
                       <div key={h.id} className="py-1 font-mono text-[9px]">
-                        {h.handicap_index}
+                        {h.handicap_index ?? '-'}
                       </div>
                     ))}
                     <div className="py-1 font-mono text-[9px] text-slate-600 bg-amber-500/5">-</div>
@@ -664,7 +812,9 @@ function SessionContent() {
             {/* BACK NINE (HOLES 10 - 18) & TOTALS */}
             <div className="space-y-2 pt-2">
               <div className="text-xs font-extrabold uppercase tracking-widest text-slate-400 flex items-center justify-between px-1">
-                <span>Back Nine (In) & Total</span>
+                <span>
+                  Back Nine {backLoopName ? `• ${backLoopName} ` : ''}(In) & Total
+                </span>
                 <span className="text-amber-400 font-mono">
                   {backPlayerScores.length > 0 ? `${backStrokesTotal} Strokes` : `Par ${backParTotal}`}
                 </span>
@@ -712,7 +862,7 @@ function SessionContent() {
                     <div className="py-1 px-1 text-left uppercase text-[9px] pl-2">HCP</div>
                     {backHoles.map((h) => (
                       <div key={h.id} className="py-1 font-mono text-[9px]">
-                        {h.handicap_index}
+                        {h.handicap_index ?? '-'}
                       </div>
                     ))}
                     <div className="py-1 font-mono text-[9px] text-slate-600 bg-amber-500/5">-</div>
@@ -864,9 +1014,14 @@ function SessionContent() {
               <div>
                 <h3 className="text-base font-black text-white">
                   Hole {activeHole.hole_number} Score
+                  {activeHole.loop_name && activeHole.physical_hole_number && (
+                    <span className="ml-2 text-xs font-semibold text-amber-400">
+                      ({activeHole.loop_name} #{activeHole.physical_hole_number})
+                    </span>
+                  )}
                 </h3>
                 <p className="text-xs text-slate-400">
-                  Par {activeHole.par} • HCP {activeHole.handicap_index} • {getDistanceForHole(activeHole.id, activePlayer.tee_id)}m
+                  Par {activeHole.par} • HCP {activeHole.handicap_index ?? '-'} • {getDistanceForHole(activeHole.id, activePlayer.tee_id)}m
                 </p>
               </div>
               <button
