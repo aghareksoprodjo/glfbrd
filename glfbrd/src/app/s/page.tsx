@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, Suspense, useCallback } from 'react';
+import { useState, useEffect, Suspense, useCallback, useMemo } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { Session, Course, Tee, Hole, HoleDistance, Player, Score } from '@/types/database';
@@ -17,6 +17,12 @@ interface CourseCombination {
   is_default: boolean;
 }
 
+interface CombinationTeeRating {
+  tee_id: string;
+  course_rating: number;
+  slope_rating: number;
+}
+
 function SessionContent() {
   const searchParams = useSearchParams();
   const rawAccessCode = searchParams.get('code') || '';
@@ -29,7 +35,8 @@ function SessionContent() {
   const [combinations, setCombinations] = useState<CourseCombination[]>([]);
   const [activeCombinationId, setActiveCombinationId] = useState<string>('');
   const [isUpdatingCombination, setIsUpdatingCombination] = useState<boolean>(false);
-  const [tees, setTees] = useState<Tee[]>([]);
+  const [baseTees, setBaseTees] = useState<Tee[]>([]);
+  const [combinationTeeRatings, setCombinationTeeRatings] = useState<CombinationTeeRating[]>([]);
   const [holes, setHoles] = useState<SessionHole[]>([]);
   const [distances, setDistances] = useState<HoleDistance[]>([]);
   const [players, setPlayers] = useState<Player[]>([]);
@@ -50,33 +57,52 @@ function SessionContent() {
   const [isSavingScore, setIsSavingScore] = useState<boolean>(false);
   const [copiedShare, setCopiedShare] = useState<boolean>(false);
 
-  // Helper to fetch 18 holes for a given combination (or legacy fallback)
-  const fetchHolesForSession = useCallback(
+  // Merge base tees with active combination's course & slope ratings
+  const tees = useMemo(() => {
+    return baseTees.map((tee) => {
+      const override = combinationTeeRatings.find((ct) => ct.tee_id === tee.id);
+      if (!override) return tee;
+      return {
+        ...tee,
+        course_rating: Number(override.course_rating),
+        slope_rating: Number(override.slope_rating),
+      };
+    });
+  }, [baseTees, combinationTeeRatings]);
+
+  // Helper to fetch 18 holes & combination-specific tee ratings for a routing
+  const fetchRoutingData = useCallback(
     async (courseId: string, combinationId: string | null) => {
       let resolvedHoles: SessionHole[] = [];
 
       if (combinationId) {
-        const { data: comboHolesData, error: comboErr } = await supabase
-          .from('combination_holes')
-          .select(`
-            round_hole_number,
-            handicap_index,
-            holes (
-              id,
-              course_id,
-              loop_id,
-              hole_number,
-              par,
-              course_loops (
-                name
+        const [comboHolesRes, comboTeesRes] = await Promise.all([
+          supabase
+            .from('combination_holes')
+            .select(`
+              round_hole_number,
+              handicap_index,
+              holes (
+                id,
+                course_id,
+                loop_id,
+                hole_number,
+                par,
+                course_loops (
+                  name
+                )
               )
-            )
-          `)
-          .eq('combination_id', combinationId)
-          .order('round_hole_number', { ascending: true });
+            `)
+            .eq('combination_id', combinationId)
+            .order('round_hole_number', { ascending: true }),
+          supabase
+            .from('combination_tees')
+            .select('tee_id, course_rating, slope_rating')
+            .eq('combination_id', combinationId),
+        ]);
 
-        if (!comboErr && comboHolesData && comboHolesData.length > 0) {
-          resolvedHoles = comboHolesData.map((row: any) => ({
+        if (!comboHolesRes.error && comboHolesRes.data && comboHolesRes.data.length > 0) {
+          resolvedHoles = comboHolesRes.data.map((row: any) => ({
             id: row.holes.id,
             course_id: row.holes.course_id,
             hole_number: row.round_hole_number,
@@ -86,6 +112,14 @@ function SessionContent() {
             handicap_index: row.handicap_index,
           }));
         }
+
+        if (!comboTeesRes.error && comboTeesRes.data) {
+          setCombinationTeeRatings(comboTeesRes.data);
+        } else {
+          setCombinationTeeRatings([]);
+        }
+      } else {
+        setCombinationTeeRatings([]);
       }
 
       // Legacy fallback for pre-migration sessions without combination_id
@@ -161,7 +195,7 @@ function SessionContent() {
         ]);
 
         if (courseRes.data) setCourse(courseRes.data);
-        if (teesRes.data) setTees(teesRes.data);
+        if (teesRes.data) setBaseTees(teesRes.data);
         if (playersRes.data) setPlayers(playersRes.data);
         if (scoresRes.data) setScores(scoresRes.data);
 
@@ -177,8 +211,8 @@ function SessionContent() {
 
         setActiveCombinationId(resolvedComboId);
 
-        // Fetch 18 holes for this combination
-        await fetchHolesForSession(sessionData.course_id, resolvedComboId || null);
+        // Fetch 18 holes and combination-specific tee ratings
+        await fetchRoutingData(sessionData.course_id, resolvedComboId || null);
 
         // Check LocalStorage for previously identified player in this session
         const storedPlayerId = localStorage.getItem(`glfbrd_identified_${sessionData.id}`);
@@ -224,7 +258,7 @@ function SessionContent() {
           const updatedSession = payload.new as any;
           if (updatedSession?.combination_id) {
             setActiveCombinationId(updatedSession.combination_id);
-            await fetchHolesForSession(updatedSession.course_id, updatedSession.combination_id);
+            await fetchRoutingData(updatedSession.course_id, updatedSession.combination_id);
           }
         }
       )
@@ -233,7 +267,7 @@ function SessionContent() {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [accessCode, fetchHolesForSession]);
+  }, [accessCode, fetchRoutingData]);
 
   // Handle changing the 18-hole combination directly on the scorecard (e.g. Starter reassignment)
   const handleCombinationChange = async (newCombinationId: string) => {
@@ -249,7 +283,7 @@ function SessionContent() {
       if (updateErr) throw updateErr;
 
       setActiveCombinationId(newCombinationId);
-      await fetchHolesForSession(session.course_id, newCombinationId);
+      await fetchRoutingData(session.course_id, newCombinationId);
     } catch (err: any) {
       console.error('Error updating 18-hole configuration:', err);
       alert('Failed to update 18-hole configuration.');

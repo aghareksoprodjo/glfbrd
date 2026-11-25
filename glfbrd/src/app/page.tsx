@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { supabase } from '@/lib/supabase';
 import { Course, Tee } from '@/types/database';
@@ -18,6 +18,12 @@ interface CourseCombination {
   is_default: boolean;
 }
 
+interface CombinationTeeRating {
+  tee_id: string;
+  course_rating: number;
+  slope_rating: number;
+}
+
 export default function LandingPage() {
   const router = useRouter();
 
@@ -26,7 +32,8 @@ export default function LandingPage() {
   const [selectedCourseId, setSelectedCourseId] = useState<string>('');
   const [combinations, setCombinations] = useState<CourseCombination[]>([]);
   const [selectedCombinationId, setSelectedCombinationId] = useState<string>('');
-  const [availableTees, setAvailableTees] = useState<Tee[]>([]);
+  const [baseTees, setBaseTees] = useState<Tee[]>([]);
+  const [combinationTeeRatings, setCombinationTeeRatings] = useState<CombinationTeeRating[]>([]);
   const [playDate, setPlayDate] = useState<string>('');
   const [players, setPlayers] = useState<PlayerInput[]>([
     { name: '', teeId: '' },
@@ -81,6 +88,7 @@ export default function LandingPage() {
     async function fetchCombinations() {
       setCombinations([]);
       setSelectedCombinationId('');
+      setCombinationTeeRatings([]);
 
       const { data, error } = await supabase
         .from('course_combinations')
@@ -98,7 +106,7 @@ export default function LandingPage() {
     fetchCombinations();
   }, [selectedCourseId]);
 
-  // Fetch Tees whenever Selected Course Changes
+  // Fetch Base Tees whenever Selected Course Changes
   useEffect(() => {
     if (!selectedCourseId) return;
 
@@ -113,11 +121,14 @@ export default function LandingPage() {
       if (error) {
         console.error('Error fetching tees:', error);
       } else if (data) {
-        setAvailableTees(data);
+        setBaseTees(data);
         if (data.length > 0) {
           const defaultTeeId = data[0].id;
           setPlayers((prev) =>
-            prev.map((p) => ({ ...p, teeId: p.teeId || defaultTeeId }))
+            prev.map((p) => ({
+              ...p,
+              teeId: data.some((t) => t.id === p.teeId) ? p.teeId : defaultTeeId,
+            }))
           );
         }
       }
@@ -126,6 +137,44 @@ export default function LandingPage() {
 
     fetchTees();
   }, [selectedCourseId]);
+
+  // Fetch Combination-Specific Ratings whenever Selected Combination Changes
+  useEffect(() => {
+    if (!selectedCombinationId) {
+      setCombinationTeeRatings([]);
+      return;
+    }
+
+    async function fetchCombinationTeeRatings() {
+      const { data, error } = await supabase
+        .from('combination_tees')
+        .select('tee_id, course_rating, slope_rating')
+        .eq('combination_id', selectedCombinationId);
+
+      if (!error && data) {
+        setCombinationTeeRatings(data);
+      } else {
+        setCombinationTeeRatings([]);
+      }
+    }
+
+    fetchCombinationTeeRatings();
+  }, [selectedCombinationId]);
+
+  // Merge base tees with combination-specific course & slope ratings
+  const availableTees = useMemo(() => {
+    const merged = baseTees.map((tee) => {
+      const override = combinationTeeRatings.find((ct) => ct.tee_id === tee.id);
+      if (!override) return tee;
+      return {
+        ...tee,
+        course_rating: Number(override.course_rating),
+        slope_rating: Number(override.slope_rating),
+      };
+    });
+
+    return merged.sort((a, b) => b.course_rating - a.course_rating);
+  }, [baseTees, combinationTeeRatings]);
 
   // Player Handlers
   const handleAddPlayer = () => {
